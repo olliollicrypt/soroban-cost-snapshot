@@ -1,0 +1,21 @@
+[package]
+name = "demo-contract"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = "29.0.1"
+
+[dev-dependencies]
+soroban-sdk = { version = "29.0.1", features = ["testutils"] }
+soroban-cost-snapshot = { path = "../.." }
+
+[features]
+# Simulates a pull request that makes `incr` more expensive.
+slow = []
+
+[workspace]

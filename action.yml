@@ -1,0 +1,183 @@
+name: Soroban cost snapshot
+description: >-
+  Runs your Soroban contract tests, compares per-function resource costs with a
+  committed baseline, writes a cost table to the job summary and fails when a
+  cost rises above a threshold.
+author: olliollicrypt
+branding:
+  icon: activity
+  color: blue
+
+inputs:
+  working-directory:
+    description: Directory of the contract package (where `cargo test` runs).
+    required: false
+    default: "."
+  baseline:
+    description: Committed baseline snapshot, relative to working-directory.
+    required: false
+    default: ".cost-snapshot.json"
+  test-command:
+    description: Command that runs the tests which call `cost_snapshot!`.
+    required: false
+    default: "cargo test"
+  threshold:
+    description: Allowed increase in percent before the check fails.
+    required: false
+    default: "5"
+  metrics:
+    description: >-
+      Comma-separated metrics that decide pass/fail (instructions, mem_bytes,
+      read_entries, write_entries, read_bytes, write_bytes, events_bytes,
+      fee_stroops, or all).
+    required: false
+    default: "instructions,fee_stroops"
+  fail-on-regression:
+    description: Set to exactly "false" to only report, never fail. Any other value fails on a regression.
+    required: false
+    default: "true"
+  fail-on-removed:
+    description: Fail when an entry of the baseline is missing from this run (deleted, renamed or skipped cost test). Set to exactly "false" to disable.
+    required: false
+    default: "true"
+  baseline-from-base-commit:
+    description: >-
+      On pull requests, read the baseline from the PR's base commit instead
+      of the PR's own files, so edits to the baseline inside the PR do not
+      change the comparison. Set to exactly "false" to use the working tree.
+    required: false
+    default: "true"
+  require-baseline:
+    description: Fail when no baseline is found. Set to exactly "false" to only warn.
+    required: false
+    default: "true"
+
+outputs:
+  result:
+    description: "One of: pass, regression (includes a missing entry when fail-on-removed), no-baseline."
+    value: ${{ steps.compare.outputs.result }}
+  snapshot-path:
+    description: Path of the freshly generated snapshot (e.g. to upload as an artifact or to update the baseline).
+    value: ${{ steps.compare.outputs.snapshot-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install soroban-cost
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        cargo install --locked --quiet --path "$ACTION_PATH" --root "$RUNNER_TEMP/soroban-cost"
+
+    - name: Run tests and collect costs
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TEST_COMMAND: ${{ inputs.test-command }}
+        SOROBAN_COST_SNAPSHOT_DIR: ${{ runner.temp }}/soroban-cost-records
+      run: |
+        set -euo pipefail
+        rm -rf "$SOROBAN_COST_SNAPSHOT_DIR"
+        # TEST_COMMAND comes from the workflow author (an action input), not
+        # from the pull request; it is passed via env, never via template
+        # expansion inside the script.
+        bash -c "$TEST_COMMAND"
+        "$RUNNER_TEMP/soroban-cost/bin/soroban-cost" collect \
+          --dir "$SOROBAN_COST_SNAPSHOT_DIR" \
+          --out "$RUNNER_TEMP/soroban-cost-head.json"
+
+    - name: Compare with baseline
+      id: compare
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BASELINE: ${{ inputs.baseline }}
+        THRESHOLD: ${{ inputs.threshold }}
+        METRICS: ${{ inputs.metrics }}
+        FAIL_ON_REGRESSION: ${{ inputs.fail-on-regression }}
+        FAIL_ON_REMOVED: ${{ inputs.fail-on-removed }}
+        FROM_BASE: ${{ inputs.baseline-from-base-commit }}
+        REQUIRE_BASELINE: ${{ inputs.require-baseline }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        set -euo pipefail
+        bin="$RUNNER_TEMP/soroban-cost/bin/soroban-cost"
+        head="$RUNNER_TEMP/soroban-cost-head.json"
+        report="$RUNNER_TEMP/soroban-cost-report.md"
+        base_file="$RUNNER_TEMP/soroban-cost-base.json"
+        echo "snapshot-path=$head" >> "$GITHUB_OUTPUT"
+
+        # Pick the baseline: from the PR base commit when possible, so the PR
+        # cannot quietly edit or delete it; otherwise from the working tree.
+        rm -f "$base_file"
+        if [ "$FROM_BASE" != "false" ] && [ -n "${BASE_SHA:-}" ]; then
+          if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$BASE_SHA" >/dev/null 2>&1 || true
+          fi
+          if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            echo "::error title=soroban-cost::Could not fetch the base commit $BASE_SHA to read the baseline. Use actions/checkout with fetch-depth: 0 (or credentials for private repos), or set baseline-from-base-commit to false."
+            echo "result=no-baseline" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if git show "$BASE_SHA:./$BASELINE" > "$base_file" 2>/dev/null; then
+            echo "Using baseline from base commit $BASE_SHA"
+          else
+            # e.g. the PR that introduces the baseline
+            rm -f "$base_file"
+            echo "::notice title=soroban-cost::No baseline in the base commit; using the working tree."
+          fi
+        fi
+        if [ ! -f "$base_file" ] && [ -f "$BASELINE" ]; then
+          cp "$BASELINE" "$base_file"
+        fi
+
+        if [ ! -f "$base_file" ]; then
+          {
+            echo "### Soroban cost snapshot"
+            echo
+            echo "No baseline found. Create one with:"
+            echo
+            echo '```sh'
+            echo 'rm -rf target/soroban-cost-snapshot && cargo test && soroban-cost collect --out .cost-snapshot.json'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "result=no-baseline" >> "$GITHUB_OUTPUT"
+          if [ "$REQUIRE_BASELINE" != "false" ]; then
+            echo "::error title=soroban-cost::No baseline file found."
+            exit 1
+          fi
+          echo "::warning title=soroban-cost::No baseline file found; nothing to compare."
+          exit 0
+        fi
+
+        extra=()
+        if [ "$FAIL_ON_REMOVED" != "false" ]; then
+          extra+=(--fail-on-removed)
+        fi
+
+        set +e
+        "$bin" diff "$base_file" "$head" \
+          --threshold "$THRESHOLD" --metrics "$METRICS" --format markdown ${extra[@]+"${extra[@]}"} > "$report"
+        code=$?
+        set -e
+        cat "$report" >> "$GITHUB_STEP_SUMMARY"
+
+        case "$code" in
+          0)
+            echo "result=pass" >> "$GITHUB_OUTPUT"
+            ;;
+          1)
+            echo "result=regression" >> "$GITHUB_OUTPUT"
+            if [ "$FAIL_ON_REGRESSION" != "false" ]; then
+              echo "::error title=soroban-cost::Contract costs rose above the threshold, or a cost entry is missing. See the job summary."
+              exit 1
+            fi
+            echo "::warning title=soroban-cost::Contract costs rose above the threshold, or a cost entry is missing. See the job summary."
+            ;;
+          *)
+            echo "::error title=soroban-cost::soroban-cost failed (exit $code)."
+            exit "$code"
+            ;;
+        esac
