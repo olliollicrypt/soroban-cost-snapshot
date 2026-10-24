@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "entries": {
+    "counter::get": {
+      "instructions": 11025,
+      "mem_bytes": 1575,
+      "read_entries": 2,
+      "write_entries": 0,
+      "read_bytes": 0,
+      "write_bytes": 0,
+      "events_bytes": 0,
+      "fee_stroops": 8
+    },
+    "counter::incr": {
+      "instructions": 19900,
+      "mem_bytes": 2905,
+      "read_entries": 2,
+      "write_entries": 1,
+      "read_bytes": 0,
+      "write_bytes": 80,
+      "events_bytes": 108,
+      "fee_stroops": 10376
+    }
+  }
+}
